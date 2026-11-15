@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -2411,7 +2412,45 @@ func workflowInputDoneAcross(ctx context.Context, graph beads.Store, work beads.
 	if err != nil || !settled {
 		return pending, err
 	}
+	if root.Metadata[beadmeta.FormulaContractMetadataKey] == beadmeta.FormulaContractGraphV2 {
+		drains, err := graph.List(beads.ListQuery{
+			Metadata: map[string]string{
+				beadmeta.RootBeadIDMetadataKey:          rootID,
+				beadmeta.KindMetadataKey:                beadmeta.KindDrain,
+				beadmeta.DrainParentConvoyIDMetadataKey: convoyID,
+			},
+			IncludeClosed: true,
+			TierMode:      beads.TierBoth,
+		})
+		if err != nil {
+			return pending, fmt.Errorf("listing completed input drains of %s: %w", rootID, err)
+		}
+		completed, err := workflowCompletedInputDrain(drains)
+		if err != nil || completed {
+			return pending, err
+		}
+	}
 	return workflowInputVerdict{RootID: rootID, State: workflowInputComplete}, nil
+}
+
+// workflowCompletedInputDrain distinguishes input completed by this workflow
+// from work that was already done outside it. A successful, nonempty native
+// drain leaves its downstream steps live even though its input members closed.
+func workflowCompletedInputDrain(drains []beads.Bead) (bool, error) {
+	for _, drain := range drains {
+		if drain.Status != "closed" || drain.Metadata[beadmeta.OutcomeMetadataKey] != beadmeta.OutcomePass ||
+			drain.Metadata[beadmeta.DrainStateMetadataKey] != beadmeta.DrainStateSucceeded {
+			continue
+		}
+		count, err := strconv.Atoi(drain.Metadata[beadmeta.DrainCountMetadataKey])
+		if err != nil {
+			return false, fmt.Errorf("reading completed drain %s unit count: %w", drain.ID, err)
+		}
+		if count > 0 {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // workflowInputMembersSettled reports whether every one of members is

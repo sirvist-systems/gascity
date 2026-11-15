@@ -227,6 +227,63 @@ func TestClassRoutedHookRetiresABindingResidentDoneWorkflowRoot(t *testing.T) {
 	f.assertSkipped(t, f.root.ID, f.step.ID)
 }
 
+// Finishing the workflow's own drain completes its input work, but leaves
+// downstream review, reporting and delivery steps to execute. Input retirement
+// must distinguish that completion from a stale workflow for already-done work.
+func TestClassRoutedHookPreservesPostDrainWork(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		change   map[string]string
+		reopen   bool
+		wantKept bool
+	}{
+		{name: "successful own drain", wantKept: true},
+		{name: "different convoy", change: map[string]string{beadmeta.DrainParentConvoyIDMetadataKey: "other-convoy"}},
+		{name: "different workflow", change: map[string]string{beadmeta.RootBeadIDMetadataKey: "other-root"}},
+		{name: "no executed units", change: map[string]string{beadmeta.DrainCountMetadataKey: "0"}},
+		{name: "unknown unit count", change: map[string]string{beadmeta.DrainCountMetadataKey: "invalid"}, wantKept: true},
+		{name: "failed drain", change: map[string]string{beadmeta.OutcomeMetadataKey: beadmeta.OutcomeFail, beadmeta.DrainStateMetadataKey: beadmeta.DrainStateFailed}},
+		{name: "unfinished drain", reopen: true},
+		{name: "ordinary finished step", change: map[string]string{beadmeta.KindMetadataKey: "task"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newDoneWorkflowSplitFixture(t, true)
+			metadata := map[string]string{
+				beadmeta.RootBeadIDMetadataKey:          f.root.ID,
+				beadmeta.KindMetadataKey:                beadmeta.KindDrain,
+				beadmeta.OutcomeMetadataKey:             beadmeta.OutcomePass,
+				beadmeta.DrainStateMetadataKey:          beadmeta.DrainStateSucceeded,
+				beadmeta.DrainParentConvoyIDMetadataKey: f.convoyID,
+				beadmeta.DrainCountMetadataKey:          "1",
+			}
+			for k, v := range tc.change {
+				metadata[k] = v
+			}
+			for k, v := range metadata {
+				if err := f.binding.SetMetadata(f.done.ID, k, v); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.reopen {
+				status := "open"
+				if err := f.binding.Update(f.done.ID, beads.UpdateOpts{Status: &status}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ops := classRoutedHookClaimOps(f.baseOps(t), f.route)
+			kept, stderr := f.retire(t, ops, f.step)
+			if got := len(kept) == 1; got != tc.wantKept {
+				t.Fatalf("post-drain step kept=%t, want %t; claim log: %s", got, tc.wantKept, stderr)
+			}
+			if tc.wantKept {
+				f.assertOpen(t, f.root.ID, f.step.ID)
+			} else {
+				f.assertSkipped(t, f.root.ID, f.step.ID)
+			}
+		})
+	}
+}
+
 // Open input work keeps the workflow live.
 func TestClassRoutedHookKeepsABindingResidentWorkflowWithOpenInput(t *testing.T) {
 	f := newDoneWorkflowSplitFixture(t, false)
