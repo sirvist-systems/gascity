@@ -4,11 +4,28 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/doctor"
 )
+
+func TestOrderTrackingRetentionCheckRecentVolumeIsNotExpiredBacklog(t *testing.T) {
+	rows := makeClosedOrderTrackingBeads(600)
+	for i := range rows {
+		rows[i].CreatedAt = time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
+		rows[i].UpdatedAt = rows[i].CreatedAt
+		rows[i].Labels = append(rows[i].Labels, "order-run:health")
+	}
+	store := beads.NewMemStoreFrom(700, rows, nil)
+	check := newOrderTrackingRetentionCheck("/city", func(string) (beads.Store, error) { return store, nil })
+	check.now = func() time.Time { return time.Date(2026, 11, 16, 13, 0, 0, 0, time.UTC) }
+	res := check.Run(&doctor.CheckContext{})
+	if res.Status != doctor.StatusOK || !strings.Contains(res.Message, "eligible") {
+		t.Fatalf("recent history must not be reported as overdue: %+v", res)
+	}
+}
 
 func makeClosedOrderTrackingBeads(n int) []beads.Bead {
 	out := make([]beads.Bead, n)
@@ -16,7 +33,7 @@ func makeClosedOrderTrackingBeads(n int) []beads.Bead {
 		out[i] = beads.Bead{
 			ID:     fmt.Sprintf("ot-%04d", i),
 			Status: "closed",
-			Labels: []string{labelOrderTracking},
+			Labels: []string{labelOrderTracking, "order-run:health"},
 		}
 	}
 	return out
@@ -33,7 +50,7 @@ func TestOrderTrackingRetentionCheck_OKWhenBelowThreshold(t *testing.T) {
 }
 
 func TestOrderTrackingRetentionCheck_WarningAtThreshold(t *testing.T) {
-	store := beads.NewMemStoreFrom(600, makeClosedOrderTrackingBeads(500), nil)
+	store := beads.NewMemStoreFrom(600, makeClosedOrderTrackingBeads(510), nil)
 	check := newOrderTrackingRetentionCheck("/city", func(string) (beads.Store, error) { return store, nil })
 
 	res := check.Run(&doctor.CheckContext{})
@@ -57,7 +74,7 @@ func TestOrderTrackingRetentionCheck_WarningAboveThreshold(t *testing.T) {
 
 func TestOrderTrackingRetentionCheck_CapFormatAtListLimit(t *testing.T) {
 	// 501 closed beads (the list cap): count displays as "≥501", not exact.
-	store := beads.NewMemStoreFrom(700, makeClosedOrderTrackingBeads(501), nil)
+	store := beads.NewMemStoreFrom(700, makeClosedOrderTrackingBeads(511), nil)
 	check := newOrderTrackingRetentionCheck("/city", func(string) (beads.Store, error) { return store, nil })
 
 	res := check.Run(&doctor.CheckContext{})

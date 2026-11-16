@@ -46,6 +46,7 @@ go_library(
         "pre_start_scripts_check.go",
         "proxied_provider.go",
         "select.go",
+        "session_inventory.go",
         "skill_checks.go",
         "skill_dangling_sink_check.go",
         "stale_local_pack_dir_check.go",

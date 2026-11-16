@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/doctor"
@@ -13,19 +14,20 @@ const (
 	orderTrackingRetentionCheckListLimit = 501
 )
 
-// orderTrackingRetentionCheck reports the count of closed order-tracking beads
-// in the city store and warns when retention sweeps are overdue. The controller
-// watchdog prunes these automatically (7d TTL default); the check surfaces
-// cities where the watchdog has not yet run or where the backlog is large enough
-// to be operationally visible. It is pure observability and never gates.
+// orderTrackingRetentionCheck reports an eligible deletion backlog using the
+// controller's configured age and per-order history floor. Small histories use
+// capped reads; histories above the threshold require the retention census.
+// It is pure observability and never deletes retained history.
 type orderTrackingRetentionCheck struct {
 	cityPath string
 	newStore func(string) (beads.Store, error)
+	policy   orderTrackingRetentionPolicy
+	now      func() time.Time
 }
 
 // newOrderTrackingRetentionCheck constructs an orderTrackingRetentionCheck.
 func newOrderTrackingRetentionCheck(cityPath string, newStore func(string) (beads.Store, error)) *orderTrackingRetentionCheck {
-	return &orderTrackingRetentionCheck{cityPath: cityPath, newStore: newStore}
+	return &orderTrackingRetentionCheck{cityPath: cityPath, newStore: newStore, policy: orderTrackingRetentionPolicyForConfig(nil), now: time.Now}
 }
 
 // Name implements doctor.Check.
@@ -83,12 +85,21 @@ func (c *orderTrackingRetentionCheck) Run(_ *doctor.CheckContext) *doctor.CheckR
 		}
 	}
 	if count >= orderTrackingRetentionCheckThreshold {
+		eligible, err := countClosedOrderTrackingRetentionEligible(stores, c.now(), c.policy, nil)
+		if err != nil {
+			res.Status = doctor.StatusWarning
+			res.Message = fmt.Sprintf("order-tracking retention unknown: %v", err)
+			return res
+		}
 		countStr := fmt.Sprintf("%d", count)
 		if capped {
 			countStr = "≥" + countStr
 		}
-		res.Status = doctor.StatusWarning
-		res.Message = fmt.Sprintf("%s closed order-tracking beads: retention watchdog will prune automatically (7d TTL default; configure [beads.policies.order_tracking].delete_after_close)", countStr)
+		res.Status = doctor.StatusOK
+		if eligible >= orderTrackingRetentionCheckThreshold {
+			res.Status = doctor.StatusWarning
+		}
+		res.Message = fmt.Sprintf("%s closed order-tracking beads; %d eligible for automatic retention (age %s; retain latest %d per order)", countStr, eligible, c.policy.deleteAfterClose, c.policy.retainLast)
 		return res
 	}
 	res.Status = doctor.StatusOK

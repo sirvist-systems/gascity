@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -67,15 +68,10 @@ type holdRouteTarget struct {
 	got    string
 }
 
-func (c *holdLabelRoutedToCheck) collect() (targets []holdRouteTarget, skipped []string) {
-	scopes := []struct{ label, path string }{{"city", c.cityPath}}
-	if c.cfg != nil {
-		for _, rig := range c.cfg.Rigs {
-			if rig.Suspended || strings.TrimSpace(rig.Path) == "" {
-				continue
-			}
-			scopes = append(scopes, struct{ label, path string }{"rig " + rig.Name, rig.Path})
-		}
+func (c *holdLabelRoutedToCheck) collect() (targets []holdRouteTarget, skipped, excluded []string) {
+	scopes, excluded, scopeErr := doctorActiveScopes(c.cfg, c.cityPath)
+	if scopeErr != nil {
+		return nil, []string{scopeErr.Error()}, excluded
 	}
 	for _, sc := range scopes {
 		if c.newStore == nil || strings.TrimSpace(sc.path) == "" {
@@ -83,6 +79,10 @@ func (c *holdLabelRoutedToCheck) collect() (targets []holdRouteTarget, skipped [
 		}
 		store, err := c.newStore(sc.path)
 		if err != nil {
+			if errors.Is(err, errDoctorStoreSuspended) {
+				excluded = append(excluded, sc.label+": not checked: suspended")
+				continue
+			}
 			skipped = append(skipped, fmt.Sprintf("%s skipped: opening bead store: %v", sc.label, err))
 			continue
 		}
@@ -109,19 +109,22 @@ func (c *holdLabelRoutedToCheck) collect() (targets []holdRouteTarget, skipped [
 			targets = append(targets, holdRouteTarget{label: sc.label, store: store, beadID: b.ID, want: want, got: got})
 		}
 	}
-	return targets, skipped
+	return targets, skipped, excluded
 }
 
 func (c *holdLabelRoutedToCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
-	targets, skipped := c.collect()
+	targets, skipped, excluded := c.collect()
 	if len(targets) == 0 && len(skipped) == 0 {
-		return okCheck(c.Name(), "no hold:<value> labels are missing a matching gc.routed_to")
+		result := okCheck(c.Name(), "no hold:<value> labels are missing a matching gc.routed_to in checked scopes")
+		result.Details = excluded
+		return result
 	}
 	details := make([]string, 0, len(targets)+len(skipped))
 	for _, tgt := range targets {
 		details = append(details, fmt.Sprintf("%s bead %s has hold:%s but gc.routed_to=%q", tgt.label, tgt.beadID, tgt.want, tgt.got))
 	}
 	details = append(details, skipped...)
+	details = append(details, excluded...)
 	sort.Strings(details)
 	if len(targets) == 0 {
 		return warnCheck(c.Name(),
@@ -136,7 +139,7 @@ func (c *holdLabelRoutedToCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult
 }
 
 func (c *holdLabelRoutedToCheck) Fix(_ *doctor.CheckContext) error {
-	targets, skipped := c.collect()
+	targets, skipped, _ := c.collect()
 	for _, tgt := range targets {
 		if err := tgt.store.SetMetadata(tgt.beadID, beadmeta.RoutedToMetadataKey, tgt.want); err != nil {
 			return fmt.Errorf("%s bead %s: backfill gc.routed_to: %w", tgt.label, tgt.beadID, err)

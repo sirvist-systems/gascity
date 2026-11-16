@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -68,16 +69,21 @@ func (c *ownerlessRuntimesCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult
 	}
 	owners := c.ownerLookup(store)
 	if owners.err != nil {
+		if errors.Is(owners.err, errDoctorStoreSuspended) {
+			res := warnCheck(c.Name(), fmt.Sprintf("ownership not checked: %v", owners.err), "repeat the ownership scan when the held scope is intentionally resumed; suspension does not prove missing ownership", nil)
+			res.Severity = doctor.SeverityAdvisory
+			return res
+		}
 		return warnCheck(c.Name(), fmt.Sprintf("skipping the ownerless-runtime scan: %v", owners.err), "fix the rig store's access, then rerun gc doctor", nil)
 	}
 	findings, err := ownerlessRuntimeFindings(owners, c.sp, c.cityPath, time.Now(), ownerlessAgeGrace(c.cfg))
-	if err != nil && len(findings) == 0 {
-		return warnCheck(c.Name(), fmt.Sprintf("listing runtimes: %v", err), "rerun gc doctor once the session provider answers", nil)
+	if err != nil {
+		return warnCheck(c.Name(), fmt.Sprintf("runtime ownership scan incomplete: %v", err), "restore the unavailable ownership or runtime read, then rerun gc doctor", findings)
 	}
 	if len(findings) == 0 {
 		return okCheck(c.Name(), "every runtime has an owning session row")
 	}
-	return warnCheck(c.Name(), fmt.Sprintf("%d runtime(s) no session row owns", len(findings)),
+	return warnCheck(c.Name(), fmt.Sprintf("%d runtime ownership finding(s)", len(findings)),
 		"the controller reaps a dead one of this city; inspect any other (gc session attach, or your provider's tools) and stop it if it is no longer wanted",
 		findings)
 }

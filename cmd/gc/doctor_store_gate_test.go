@@ -10,7 +10,65 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/doctor"
+	"github.com/gastownhall/gascity/internal/runtime"
 )
+
+func TestDoctorRoutingChecksDistinguishSuspensionFromStoreFailure(t *testing.T) {
+	constructors := []func(*config.City, string, func(string) (beads.Store, error)) doctor.Check{
+		func(c *config.City, p string, f func(string) (beads.Store, error)) doctor.Check {
+			return newRunTargetRoutedToBackfillCheck(c, p, f)
+		},
+		func(c *config.City, p string, f func(string) (beads.Store, error)) doctor.Check {
+			return newRouteRecoveryQuarantineCheck(c, p, f)
+		},
+		func(c *config.City, p string, f func(string) (beads.Store, error)) doctor.Check {
+			return newHoldLabelRoutedToCheck(c, p, f)
+		},
+	}
+	for _, makeCheck := range constructors {
+		for _, suspended := range []bool{true, false} {
+			cfg := &config.City{Rigs: []config.Rig{{Name: "held", Path: "/held"}}}
+			store := beads.NewMemStore()
+			check := makeCheck(cfg, "/city", func(path string) (beads.Store, error) {
+				if path == "/held" {
+					if suspended {
+						return nil, errDoctorStoreSuspended
+					}
+					return nil, errors.New("database unavailable")
+				}
+				return store, nil
+			})
+			t.Run(check.Name()+"/suspended="+map[bool]string{true: "true", false: "false"}[suspended], func(t *testing.T) {
+				res := check.Run(&doctor.CheckContext{})
+				if suspended {
+					if res.Status != doctor.StatusOK || !strings.Contains(strings.Join(res.Details, " "), "suspended") {
+						t.Fatalf("intentional exclusion must be explicit, without a fault: %+v", res)
+					}
+					if err := check.Fix(&doctor.CheckContext{}); err != nil {
+						t.Fatalf("must not try to repair a suspended store: %v", err)
+					}
+				} else if res.Status != doctor.StatusWarning || !strings.Contains(strings.Join(res.Details, " "), "database unavailable") {
+					t.Fatalf("real store failure must remain visible: %+v", res)
+				}
+			})
+		}
+	}
+}
+
+func TestDoctorOwnerlessSuspensionRemainsIncomplete(t *testing.T) {
+	cfg := &config.City{Rigs: []config.Rig{{Name: "held", Path: "/held"}}}
+	store := beads.NewMemStore()
+	check := newOwnerlessRuntimesCheck(cfg, "/city", func(path string) (beads.Store, error) {
+		if path == "/held" {
+			return nil, errDoctorStoreSuspended
+		}
+		return store, nil
+	}, runtime.NewFake(), nil)
+	res := check.Run(&doctor.CheckContext{})
+	if res.Status != doctor.StatusWarning || res.Severity != doctor.SeverityAdvisory || !strings.Contains(res.Message, "suspended") || strings.Contains(res.FixHint, "fix the rig store") {
+		t.Fatalf("suspension is incomplete coverage, not missing ownership or a broken store: %+v", res)
+	}
+}
 
 // stubDoctorStoreLiveness makes the scopes whose base name is in stopped read
 // as stopped proxied stores, and fails the test if the bead-store preflight

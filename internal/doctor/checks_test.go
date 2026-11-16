@@ -4652,3 +4652,166 @@ func TestDoltServerCheck_UnreachableManagedDoltNamesItsInfraScope(t *testing.T) 
 		})
 	}
 }
+
+func TestRegisteredSessionChecksUseRuntimeIdentity(t *testing.T) {
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), "session-dynamic-42", runtime.Config{}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{Agents: []config.Agent{{Name: "worker", ProcessNames: []string{"claude"}}}}
+	inventory := func() (SessionInventory, error) {
+		return SessionInventory{Sessions: []SessionExpectation{{Name: "session-dynamic-42", Template: "worker", Expected: true, ProcessNames: []string{"claude"}}}}, nil
+	}
+	missing := NewAgentSessionsCheck(cfg, "city", "", sp)
+	missing.Sessions = inventory
+	orphan := NewOrphanSessionsCheck(cfg, "city", "", sp)
+	orphan.Sessions = inventory
+	zombie := NewZombieSessionsCheck(cfg, "city", "", sp)
+	zombie.Sessions = inventory
+	for _, check := range []Check{missing, orphan, zombie} {
+		if result := check.Run(&CheckContext{}); result.Status != StatusOK {
+			t.Errorf("%s: %+v", check.Name(), result)
+		}
+	}
+	sp.Zombies["session-dynamic-42"] = true
+	if result := zombie.Run(&CheckContext{}); result.Status != StatusWarning {
+		t.Errorf("dynamic zombie was missed: %+v", result)
+	}
+}
+
+func TestRegisteredSessionChecksDoNotRequireDemandOnlyTemplate(t *testing.T) {
+	check := NewAgentSessionsCheck(&config.City{Agents: []config.Agent{{Name: "worker"}}}, "city", "", runtime.NewFake())
+	check.Sessions = func() (SessionInventory, error) { return SessionInventory{}, nil }
+	if result := check.Run(&CheckContext{}); result.Status != StatusOK {
+		t.Fatalf("demand-only template falsely missing: %+v", result)
+	}
+}
+
+type doctorLivenessErrorProvider struct{ *runtime.Fake }
+
+func (p doctorLivenessErrorProvider) ObserveLivenessWithError(string, []string) (runtime.Liveness, error) {
+	return runtime.Liveness{}, errors.New("provider unreachable")
+}
+
+func TestRegisteredSessionChecksPreserveFaultsAndUncertainty(t *testing.T) {
+	for _, scenario := range []string{"missing", "dormant", "minimum", "unknown registry", "unknown liveness", "orphan"} {
+		t.Run(scenario, func(t *testing.T) {
+			fake := runtime.NewFake()
+			if err := fake.Start(context.Background(), "extra", runtime.Config{}); err != nil {
+				t.Fatal(err)
+			}
+			var sp runtime.Provider = fake
+			inv := SessionInventory{Sessions: []SessionExpectation{{Name: "dynamic", Template: "worker", Expected: scenario != "dormant", ProcessNames: []string{"claude"}}}}
+			var loadErr error
+			if scenario == "minimum" {
+				inv.Sessions = nil
+				inv.Minimums = map[string]int{"worker": 2}
+			}
+			if scenario == "unknown registry" {
+				loadErr = errors.New("registry partial read")
+			}
+			if scenario == "unknown liveness" {
+				sp = doctorLivenessErrorProvider{fake}
+			}
+			loader := func() (SessionInventory, error) { return inv, loadErr }
+			cfg := &config.City{}
+			missing := NewAgentSessionsCheck(cfg, "city", "", sp)
+			missing.Sessions = loader
+			zombie := NewZombieSessionsCheck(cfg, "city", "", sp)
+			zombie.Sessions = loader
+			orphan := NewOrphanSessionsCheck(cfg, "city", "", sp)
+			orphan.Sessions = loader
+			ctx := &CheckContext{CityPath: t.TempDir()}
+			result := missing.Run(ctx)
+			if scenario == "dormant" {
+				if result.Status != StatusOK {
+					t.Fatalf("dormant runtime required: %+v", result)
+				}
+			} else if result.Status != StatusWarning {
+				t.Fatalf("fault hidden: %+v", result)
+			}
+			if scenario == "unknown registry" || scenario == "unknown liveness" {
+				if err := zombie.Fix(ctx); err == nil {
+					t.Fatal("uncertain liveness was fixable")
+				}
+				if scenario == "unknown registry" {
+					if result := orphan.Run(ctx); !strings.Contains(result.Message, "registry") {
+						t.Fatalf("registry failure hidden: %+v", result)
+					}
+					if err := orphan.Fix(ctx); err == nil {
+						t.Fatal("incomplete registry permitted orphan fix")
+					}
+				}
+				if !fake.IsRunning("extra") {
+					t.Fatal("uncertain session was stopped")
+				}
+			}
+			if scenario == "orphan" {
+				result := orphan.Run(ctx)
+				if result.Status != StatusWarning || !strings.Contains(strings.Join(result.Details, " "), "extra") {
+					t.Fatalf("genuine orphan missed: %+v", result)
+				}
+			}
+		})
+	}
+}
+
+func TestRegisteredSuspendedSessionStillOwnsRuntime(t *testing.T) {
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), "held", runtime.Config{}); err != nil {
+		t.Fatal(err)
+	}
+	check := NewOrphanSessionsCheck(&config.City{}, "city", "", sp)
+	check.Sessions = func() (SessionInventory, error) {
+		return SessionInventory{Sessions: []SessionExpectation{{Name: "held"}}}, nil
+	}
+	ctx := &CheckContext{CityPath: t.TempDir()}
+	if result := check.Run(ctx); result.Status != StatusOK {
+		t.Fatalf("held owner lost: %+v", result)
+	}
+	if err := check.Fix(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !sp.IsRunning("held") {
+		t.Fatal("held registered runtime was stopped")
+	}
+}
+
+func TestRegisteredDormantSessionStillGetsZombieObservation(t *testing.T) {
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), "dormant", runtime.Config{}); err != nil {
+		t.Fatal(err)
+	}
+	sp.Zombies["dormant"] = true
+	check := NewZombieSessionsCheck(&config.City{}, "city", "", sp)
+	check.Sessions = func() (SessionInventory, error) {
+		return SessionInventory{Sessions: []SessionExpectation{{Name: "dormant", CheckHealth: true, ProcessNames: []string{"claude"}}}}, nil
+	}
+	if result := check.Run(&CheckContext{}); result.Status != StatusWarning {
+		t.Fatalf("present dormant zombie missed: %+v", result)
+	}
+}
+
+func TestRegisteredZombieFixRefusesNewlyUnreadableHold(t *testing.T) {
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), "worker", runtime.Config{}); err != nil {
+		t.Fatal(err)
+	}
+	sp.Zombies["worker"] = true
+	check := NewZombieSessionsCheck(&config.City{}, "city", "", sp)
+	reads := 0
+	check.Sessions = func() (SessionInventory, error) {
+		reads++
+		inventory := SessionInventory{Sessions: []SessionExpectation{{Name: "worker", Expected: true, CheckHealth: true, ProcessNames: []string{"claude"}}}}
+		if reads > 1 {
+			inventory.Unknown = []string{"unreadable operator hold"}
+		}
+		return inventory, nil
+	}
+	if err := check.Fix(&CheckContext{CityPath: t.TempDir()}); err == nil {
+		t.Fatal("new unreadable hold allowed cleanup")
+	}
+	if !sp.IsRunning("worker") {
+		t.Fatal("session with unreadable hold was stopped")
+	}
+}

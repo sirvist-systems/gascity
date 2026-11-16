@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -25,6 +26,7 @@ import (
 )
 
 var (
+	doctorControllerSessionMode = queryControllerReconcilerMode
 	newDoctorDoltServerCheck    = doctor.NewDoltServerCheck
 	newDoctorRigDoltServerCheck = doctor.NewRigDoltServerCheck
 	newDoctorDoltBackupCheck    = doctor.NewDoltBackupCheck
@@ -425,6 +427,8 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 	register(doctor.NewSupervisorUnitOwnershipCheck(opts.SupervisorRunning, opts.SupervisorPID, opts.SupervisorUnitOwnership))
 	register(doctor.NewSupervisorBinaryCheck(opts.SupervisorRunning, opts.SupervisorPID, opts.SupervisorBinary))
 
+	storeFactory := storeGate.StoreFactory(perRunStoreFactory(openStoreForCity(cityPath)))
+
 	// sessionSP is the session provider the session checks read, and the
 	// ownerless-runtimes check after them; sessionSPErr is why there is none.
 	var sessionSP runtime.Provider
@@ -444,15 +448,35 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 				register(doctor.ErrorCheck("session-provider", err.Error()))
 				sessionSPErr = err
 			} else {
-				register(doctor.NewAgentSessionsCheck(cfg, cityName, st, sp))
-				register(doctor.NewZombieSessionsCheck(cfg, cityName, st, sp))
-				register(doctor.NewOrphanSessionsCheck(cfg, cityName, st, sp))
+				agents := doctor.NewAgentSessionsCheck(cfg, cityName, st, sp)
+				zombies := doctor.NewZombieSessionsCheck(cfg, cityName, st, sp)
+				orphans := doctor.NewOrphanSessionsCheck(cfg, cityName, st, sp)
+				mode, _ := doctorReconcilerMode(cfg, cityPath, os.LookupEnv)
+				var modeErr error
+				if opts.ControllerRunning {
+					var known bool
+					mode, known, modeErr = doctorControllerSessionMode(cityPath, time.Second)
+					if modeErr == nil && !known {
+						modeErr = fmt.Errorf("controller did not report its session reconciler mode")
+					}
+				}
+				if modeErr != nil {
+					unknown := func() (doctor.SessionInventory, error) {
+						return doctor.SessionInventory{}, fmt.Errorf("session reconciler mode unknown: %w", modeErr)
+					}
+					agents.Sessions, zombies.Sessions, orphans.Sessions = unknown, unknown, unknown
+				} else if mode == reconcilerV2 {
+					inventory := doctorSessionInventory(cityPath, cfg)
+					agents.Sessions, zombies.Sessions = inventory, inventory
+					orphans.Sessions = doctorOwnershipInventory(cityPath, cfg, newOwnerlessRuntimesCheck(cfg, cityPath, storeFactory, sp, nil))
+				}
+				register(agents)
+				register(zombies)
+				register(orphans)
 				sessionSP = sp
 			}
 		}
 	}
-
-	storeFactory := storeGate.StoreFactory(perRunStoreFactory(openStoreForCity(cityPath)))
 
 	// One preflight gates all store-dependent checks so outages are not re-probed (#5064).
 	storeOK := true
@@ -524,7 +548,9 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 			}
 			registerCityStoreCheck(newWorkOptionMetadataMigrationCheck(cfg, cityPath, storeFactory))
 			registerCityStoreCheck(newBacklogDepthCheck(cityPath, storeFactory))
-			registerCityStoreCheck(newOrderTrackingRetentionCheck(cityPath, storeFactory))
+			retentionCheck := newOrderTrackingRetentionCheck(cityPath, storeFactory)
+			retentionCheck.policy = orderTrackingRetentionPolicyForConfig(cfg)
+			registerCityStoreCheck(retentionCheck)
 			registerCityStoreCheck(&sessionModelDoctorCheck{cfg: cfg, cityPath: cityPath, newStore: storeFactory})
 			registerCityStoreCheck(newStartupHealthEpisodesCheck(cfg, cityPath, storeFactory))
 			registerCityStoreCheck(newOwnerlessRuntimesCheck(cfg, cityPath, storeFactory, sessionSP, sessionSPErr))

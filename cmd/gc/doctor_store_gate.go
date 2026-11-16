@@ -2,13 +2,17 @@ package main
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/doctor"
+	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/orders"
+	"github.com/gastownhall/gascity/internal/suspensionstate"
 )
 
 // errDoctorStoreNotRunning is what a store open or order lookup answers for a
@@ -166,4 +170,28 @@ func (g *doctorStoreGate) OrderLastRun(cityPath string, cfg *config.City, lastRu
 		}
 		return lastRun(order)
 	}
+}
+
+// doctorActiveScopes excludes intentional rig holds without waking their stores.
+// Exclusions remain visible; an unreadable suspension record is not a clean scan.
+func doctorActiveScopes(cfg *config.City, cityPath string) (scopes []struct{ label, path string }, excluded []string, err error) {
+	scopes = append(scopes, struct{ label, path string }{"city", cityPath})
+	if cfg == nil {
+		return scopes, nil, nil
+	}
+	state, err := loadSuspensionState(fsys.OSFS{}, cityPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("reading suspension state: %w", err)
+	}
+	for _, rig := range cfg.Rigs {
+		if strings.TrimSpace(rig.Path) == "" {
+			continue
+		}
+		if effectiveCitySuspended(cfg, state) || suspensionstate.EffectiveRigSuspended(state, rig.Name, rig.EffectiveSuspendedOnStart()) {
+			excluded = append(excluded, "rig "+rig.Name+": not checked: suspended")
+			continue
+		}
+		scopes = append(scopes, struct{ label, path string }{"rig " + rig.Name, rig.Path})
+	}
+	return scopes, excluded, nil
 }

@@ -270,15 +270,29 @@ type ownerLookup struct {
 // every one answers beads.ErrNotFound. A store that errors, a lookup missing
 // a store, or no store at all proves nothing, so the owner is not missing.
 func (l ownerLookup) notFound(ownerID string) bool {
-	if l.err != nil || len(l.stores) == 0 {
-		return false
+	missing, _ := l.notFoundWithError(ownerID)
+	return missing
+}
+
+// notFoundWithError preserves uncertainty for diagnostics; the reaper's boolean
+// adapter continues to treat every failed read as insufficient proof to stop.
+func (l ownerLookup) notFoundWithError(ownerID string) (bool, error) {
+	if l.err != nil {
+		return false, l.err
+	}
+	if len(l.stores) == 0 {
+		return false, fmt.Errorf("no ownership stores available")
 	}
 	for _, store := range l.stores {
-		if _, err := beads.HandlesFor(store).Live.Get(ownerID); !errors.Is(err, beads.ErrNotFound) {
-			return false
+		_, err := beads.HandlesFor(store).Live.Get(ownerID)
+		if err == nil {
+			return false, nil
+		}
+		if !errors.Is(err, beads.ErrNotFound) {
+			return false, err
 		}
 	}
-	return true
+	return true, nil
 }
 
 // sessionOwnerLookup is the lookup over cityPath's session plan: sessions
@@ -381,6 +395,7 @@ func ownerlessRuntimeFindings(owners ownerLookup, sp runtime.Provider, cityPath 
 		return nil, err
 	}
 	var findings []string
+	errs := []error{err}
 	for _, name := range slices.Sorted(slices.Values(names)) {
 		id, idErr := sp.GetMeta(name, "GC_SESSION_ID")
 		id = strings.TrimSpace(id)
@@ -391,7 +406,13 @@ func ownerlessRuntimeFindings(owners ownerLookup, sp runtime.Provider, cityPath 
 		case id == "":
 			findings = append(findings, fmt.Sprintf("%s: no GC_SESSION_ID; no owner can be proven", name))
 			continue
-		case !owners.notFound(id):
+		}
+		missing, lookupErr := owners.notFoundWithError(id)
+		if lookupErr != nil {
+			errs = append(errs, fmt.Errorf("%s: ownership unknown: %w", name, lookupErr))
+			continue
+		}
+		if !missing {
 			continue
 		}
 		v := classifyOwnerlessRuntime(sp, cityPath, name, id, now, grace)
@@ -401,5 +422,5 @@ func ownerlessRuntimeFindings(owners ownerLookup, sp runtime.Provider, cityPath 
 		}
 		findings = append(findings, fmt.Sprintf("%s: session bead %s not found (%s)", name, id, why))
 	}
-	return findings, err
+	return findings, errors.Join(errs...)
 }

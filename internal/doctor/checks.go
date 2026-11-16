@@ -472,8 +472,32 @@ func (c *BinaryCheck) Fix(_ *CheckContext) error { return nil }
 
 // --- Session checks (skipped when controller is running) ---
 
+// SessionInventory is a persisted ownership snapshot plus explicit runtime requirements.
+// The loader must return an error for incomplete reads; an empty successful list
+// means no sessions are registered, not that the registry could not be read.
+type SessionInventory struct {
+	Unknown  []string
+	Sessions []SessionExpectation
+	Minimums map[string]int
+}
+
+// SessionExpectation names a registered or explicitly required runtime.
+type SessionExpectation struct {
+	Unregistered bool
+	CheckHealth  bool
+	Pool         bool
+	Name         string
+	Template     string
+	Expected     bool
+	ProcessNames []string
+}
+
+// SessionInventoryFunc loads current ownership and runtime expectations.
+type SessionInventoryFunc func() (SessionInventory, error)
+
 // AgentSessionsCheck verifies non-suspended agents have running sessions.
 type AgentSessionsCheck struct {
+	Sessions        SessionInventoryFunc
 	cfg             *config.City
 	cityName        string
 	sessionTemplate string
@@ -489,7 +513,11 @@ func NewAgentSessionsCheck(cfg *config.City, cityName, sessionTemplate string, s
 func (c *AgentSessionsCheck) Name() string { return "agent-sessions" }
 
 // Run checks that each non-suspended agent has a running session.
-func (c *AgentSessionsCheck) Run(_ *CheckContext) *CheckResult {
+func (c *AgentSessionsCheck) Run(ctx *CheckContext) *CheckResult {
+	if c.Sessions != nil {
+		missing, _, unknown := registeredSessionHealth(c.Sessions, c.sp, ctx)
+		return registeredSessionResult(c.Name(), "all required registered sessions running", "missing session/capacity finding(s)", missing, unknown)
+	}
 	r := &CheckResult{Name: c.Name()}
 	var missing []string
 	for _, a := range c.cfg.Agents {
@@ -521,6 +549,7 @@ func (c *AgentSessionsCheck) Fix(_ *CheckContext) error { return nil }
 
 // ZombieSessionsCheck finds sessions that are alive but the agent process is dead.
 type ZombieSessionsCheck struct {
+	Sessions        SessionInventoryFunc
 	cfg             *config.City
 	cityName        string
 	sessionTemplate string
@@ -536,7 +565,11 @@ func NewZombieSessionsCheck(cfg *config.City, cityName, sessionTemplate string, 
 func (c *ZombieSessionsCheck) Name() string { return "zombie-sessions" }
 
 // Run checks for sessions where the session exists but the agent process is dead.
-func (c *ZombieSessionsCheck) Run(_ *CheckContext) *CheckResult {
+func (c *ZombieSessionsCheck) Run(ctx *CheckContext) *CheckResult {
+	if c.Sessions != nil {
+		_, zombies, unknown := registeredSessionHealth(c.Sessions, c.sp, ctx)
+		return registeredSessionResult(c.Name(), "no zombie sessions", "zombie session(s)", zombies, unknown)
+	}
 	r := &CheckResult{Name: c.Name()}
 	var zombies []string
 	for _, a := range c.cfg.Agents {
@@ -572,6 +605,44 @@ func (c *ZombieSessionsCheck) Fix(ctx *CheckContext) error {
 	if IsControllerRunning(ctx.CityPath) {
 		return errControllerRunningFixSkipped
 	}
+	if c.Sessions != nil {
+		_, zombies, unknown := registeredSessionHealth(c.Sessions, c.sp, ctx)
+		if len(unknown) > 0 {
+			return fmt.Errorf("session observations incomplete: %v", unknown)
+		}
+		for _, name := range zombies {
+			if ctx.Canceled() {
+				return fmt.Errorf("session fix canceled")
+			}
+			// Refresh both ownership and liveness immediately before stopping anything.
+			inventory, err := c.Sessions()
+			if err != nil {
+				return err
+			}
+			if len(inventory.Unknown) > 0 {
+				return fmt.Errorf("session observations incomplete: %v", inventory.Unknown)
+			}
+			for _, target := range inventory.Sessions {
+				if target.Name != name || (!target.Expected && !target.CheckHealth) {
+					continue
+				}
+				live, err := runtime.ObserveLivenessWithError(c.sp, name, target.ProcessNames)
+				if err != nil {
+					return err
+				}
+				if live.Corpse || (live.Running && !live.Alive && len(target.ProcessNames) > 0) {
+					if ctx.Canceled() {
+						return fmt.Errorf("session fix canceled")
+					}
+					if err := runtime.StopForCleanup(c.sp, name); err != nil {
+						return fmt.Errorf("killing zombie session %q: %w", name, err)
+					}
+				}
+				break
+			}
+		}
+		return nil
+	}
 	for _, a := range c.cfg.Agents {
 		if a.Suspended || len(a.ProcessNames) == 0 {
 			continue
@@ -588,6 +659,7 @@ func (c *ZombieSessionsCheck) Fix(ctx *CheckContext) error {
 
 // OrphanSessionsCheck finds sessions with the city prefix not in config.
 type OrphanSessionsCheck struct {
+	Sessions        SessionInventoryFunc
 	cfg             *config.City
 	cityName        string
 	sessionTemplate string
@@ -616,9 +688,25 @@ func (c *OrphanSessionsCheck) Run(_ *CheckContext) *CheckResult {
 
 	// Build set of expected session names.
 	expected := make(map[string]bool)
-	for _, a := range c.cfg.Agents {
-		sn := agent.SessionNameFor(c.cityName, a.QualifiedName(), c.sessionTemplate)
-		expected[sn] = true
+	if c.Sessions != nil {
+		var registryErr error
+		expected, registryErr = registeredSessionNames(c.Sessions)
+		if registryErr != nil {
+			var unverified []string
+			for _, name := range running {
+				if !expected[name] {
+					unverified = append(unverified, name)
+				}
+			}
+			if len(unverified) > 0 || partialList {
+				return &CheckResult{Name: c.Name(), Status: StatusWarning, Severity: SeverityAdvisory, Message: "runtime ownership not fully checked: " + registryErr.Error(), Details: unverified}
+			}
+			return &CheckResult{Name: c.Name(), Status: StatusOK, Message: "all observed runtimes have registered owners", Details: []string{"additional ownership scopes not checked: " + registryErr.Error()}}
+		}
+	} else {
+		for _, a := range c.cfg.Agents {
+			expected[agent.SessionNameFor(c.cityName, a.QualifiedName(), c.sessionTemplate)] = true
+		}
 	}
 
 	var orphans []string
@@ -669,11 +757,27 @@ func (c *OrphanSessionsCheck) Fix(ctx *CheckContext) error {
 		return err
 	}
 	expected := make(map[string]bool)
-	for _, a := range c.cfg.Agents {
-		sn := agent.SessionNameFor(c.cityName, a.QualifiedName(), c.sessionTemplate)
-		expected[sn] = true
+	if c.Sessions != nil {
+		var registryErr error
+		expected, registryErr = registeredSessionNames(c.Sessions)
+		if registryErr != nil {
+			return registryErr
+		}
+	} else {
+		for _, a := range c.cfg.Agents {
+			expected[agent.SessionNameFor(c.cityName, a.QualifiedName(), c.sessionTemplate)] = true
+		}
 	}
 	for _, s := range running {
+		if ctx.Canceled() {
+			return fmt.Errorf("session fix canceled")
+		}
+		if c.Sessions != nil {
+			expected, err = registeredSessionNames(c.Sessions)
+			if err != nil {
+				return err
+			}
+		}
 		if !expected[s] {
 			if err := runtime.StopForCleanup(c.sp, s); err != nil {
 				return fmt.Errorf("killing orphan session %q: %w", s, err)

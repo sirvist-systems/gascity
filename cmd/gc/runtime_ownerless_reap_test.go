@@ -339,8 +339,8 @@ func TestOwnerlessRuntimeFindings(t *testing.T) {
 	// A store that cannot answer proves no owner gone: only the runtime
 	// without GC_SESSION_ID is named.
 	findings, err = ownerlessRuntimeFindings(ownerLookup{stores: []beads.Store{&ownerGetErrStore{MemStore: beads.NewMemStore(), err: errors.New("store unreachable")}}}, c.sp, c.city, ownerlessT0, time.Minute)
-	if err != nil {
-		t.Fatal(err)
+	if err == nil || !strings.Contains(err.Error(), "store unreachable") {
+		t.Fatalf("unreadable owner lookup must remain visible: %v", err)
 	}
 	if got := strings.Join(findings, "\n"); len(findings) != 1 || !strings.Contains(got, "anon: no GC_SESSION_ID") {
 		t.Errorf("findings over an unreadable store %q, want the anon runtime only", got)
@@ -580,5 +580,15 @@ func TestOwnerlessFinalCheckReadsNow(t *testing.T) {
 	} // the check's clock reads the runtime a minute old
 	if n := reapRuntimesBoundToClosedBeadsWith(c.store, c.snapshot, nil, c.sp, nil, c.city, o, &c.stderr); n != 0 {
 		t.Fatalf("reaped %d, want the final check's own clock to hold it", n)
+	}
+}
+
+func TestOwnerlessDoctorReadFailureCannotReportCleanOwnership(t *testing.T) {
+	c := newOwnerlessCase(t)
+	store := &ownerGetErrStore{MemStore: beads.NewMemStore(), err: errors.New("ownership read unavailable")}
+	check := newOwnerlessRuntimesCheck(nil, c.city, func(string) (beads.Store, error) { return store, nil }, c.sp, nil)
+	result := check.Run(nil)
+	if result.Status != doctor.StatusWarning || !strings.Contains(result.Message, "ownership read unavailable") {
+		t.Fatalf("failed ownership read reported clean: %+v", result)
 	}
 }

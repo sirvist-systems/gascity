@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -45,15 +46,10 @@ type backfillTarget struct {
 	runTarget string
 }
 
-func (c *runTargetRoutedToBackfillCheck) collect() (targets []backfillTarget, skipped []string) {
-	scopes := []struct{ label, path string }{{"city", c.cityPath}}
-	if c.cfg != nil {
-		for _, rig := range c.cfg.Rigs {
-			if rig.Suspended || strings.TrimSpace(rig.Path) == "" {
-				continue
-			}
-			scopes = append(scopes, struct{ label, path string }{"rig " + rig.Name, rig.Path})
-		}
+func (c *runTargetRoutedToBackfillCheck) collect() (targets []backfillTarget, skipped, excluded []string) {
+	scopes, excluded, scopeErr := doctorActiveScopes(c.cfg, c.cityPath)
+	if scopeErr != nil {
+		return nil, []string{scopeErr.Error()}, excluded
 	}
 	collectFrom := func(label string, store beads.Store) {
 		// Workflow roots are the only pool-routed persisted beads that need
@@ -85,6 +81,10 @@ func (c *runTargetRoutedToBackfillCheck) collect() (targets []backfillTarget, sk
 		}
 		store, err := c.newStore(sc.path)
 		if err != nil {
+			if errors.Is(err, errDoctorStoreSuspended) {
+				excluded = append(excluded, sc.label+": not checked: suspended")
+				continue
+			}
 			skipped = append(skipped, fmt.Sprintf("%s skipped: opening bead store: %v", sc.label, err))
 			continue
 		}
@@ -98,19 +98,22 @@ func (c *runTargetRoutedToBackfillCheck) collect() (targets []backfillTarget, sk
 	if graph, relocated := cliStorageRoutes(c.cityPath).storeFor(coordclass.ClassGraph); relocated && graph != nil { // residency:allow — a doctor scan of every workflow root wherever it lives; the binding is the one scope the work-scope walk above cannot reach
 		collectFrom("graph binding", graph)
 	}
-	return targets, skipped
+	return targets, skipped, excluded
 }
 
 func (c *runTargetRoutedToBackfillCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
-	targets, skipped := c.collect()
+	targets, skipped, excluded := c.collect()
 	if len(targets) == 0 && len(skipped) == 0 {
-		return okCheck(c.Name(), "no workflow roots need gc.routed_to backfill")
+		result := okCheck(c.Name(), "no workflow roots need gc.routed_to backfill in checked scopes")
+		result.Details = excluded
+		return result
 	}
 	details := make([]string, 0, len(targets)+len(skipped))
 	for _, tgt := range targets {
 		details = append(details, fmt.Sprintf("%s bead %s has gc.run_target=%q with empty gc.routed_to", tgt.label, tgt.beadID, tgt.runTarget))
 	}
 	details = append(details, skipped...)
+	details = append(details, excluded...)
 	sort.Strings(details)
 	if len(targets) == 0 {
 		return warnCheck(c.Name(),
@@ -125,7 +128,7 @@ func (c *runTargetRoutedToBackfillCheck) Run(_ *doctor.CheckContext) *doctor.Che
 }
 
 func (c *runTargetRoutedToBackfillCheck) Fix(_ *doctor.CheckContext) error {
-	targets, skipped := c.collect()
+	targets, skipped, _ := c.collect()
 	for _, tgt := range targets {
 		if err := tgt.store.SetMetadata(tgt.beadID, beadmeta.RoutedToMetadataKey, tgt.runTarget); err != nil {
 			return fmt.Errorf("%s bead %s: backfill gc.routed_to: %w", tgt.label, tgt.beadID, err)

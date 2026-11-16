@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -54,15 +55,10 @@ type quarantinedRoute struct {
 	reason string
 }
 
-func (c *routeRecoveryQuarantineCheck) collect() (found []quarantinedRoute, skipped []string) {
-	scopes := []struct{ label, path string }{{"city", c.cityPath}}
-	if c.cfg != nil {
-		for _, rig := range c.cfg.Rigs {
-			if rig.Suspended || strings.TrimSpace(rig.Path) == "" {
-				continue
-			}
-			scopes = append(scopes, struct{ label, path string }{"rig " + rig.Name, rig.Path})
-		}
+func (c *routeRecoveryQuarantineCheck) collect() (found []quarantinedRoute, skipped, excluded []string) {
+	scopes, excluded, scopeErr := doctorActiveScopes(c.cfg, c.cityPath)
+	if scopeErr != nil {
+		return nil, []string{scopeErr.Error()}, excluded
 	}
 	for _, sc := range scopes {
 		if c.newStore == nil || strings.TrimSpace(sc.path) == "" {
@@ -70,6 +66,10 @@ func (c *routeRecoveryQuarantineCheck) collect() (found []quarantinedRoute, skip
 		}
 		store, err := c.newStore(sc.path)
 		if err != nil {
+			if errors.Is(err, errDoctorStoreSuspended) {
+				excluded = append(excluded, sc.label+": not checked: suspended")
+				continue
+			}
 			skipped = append(skipped, fmt.Sprintf("%s skipped: opening bead store: %v", sc.label, err))
 			continue
 		}
@@ -93,13 +93,15 @@ func (c *routeRecoveryQuarantineCheck) collect() (found []quarantinedRoute, skip
 			found = append(found, quarantinedRoute{label: sc.label, store: store, beadID: b.ID, reason: reason})
 		}
 	}
-	return found, skipped
+	return found, skipped, excluded
 }
 
 func (c *routeRecoveryQuarantineCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
-	found, skipped := c.collect()
+	found, skipped, excluded := c.collect()
 	if len(found) == 0 && len(skipped) == 0 {
-		return okCheck(c.Name(), "no beads are quarantined by route recovery")
+		result := okCheck(c.Name(), "no beads are quarantined by route recovery in checked scopes")
+		result.Details = excluded
+		return result
 	}
 	details := make([]string, 0, len(found)+len(skipped))
 	flapping := 0
@@ -110,6 +112,7 @@ func (c *routeRecoveryQuarantineCheck) Run(_ *doctor.CheckContext) *doctor.Check
 		details = append(details, fmt.Sprintf("%s bead %s quarantined: %s", q.label, q.beadID, q.reason))
 	}
 	details = append(details, skipped...)
+	details = append(details, excluded...)
 	sort.Strings(details)
 	if len(found) == 0 {
 		return warnCheck(c.Name(),
@@ -130,7 +133,7 @@ func (c *routeRecoveryQuarantineCheck) Run(_ *doctor.CheckContext) *doctor.Check
 }
 
 func (c *routeRecoveryQuarantineCheck) Fix(_ *doctor.CheckContext) error {
-	found, skipped := c.collect()
+	found, skipped, _ := c.collect()
 	for _, q := range found {
 		if err := q.store.SetMetadataBatch(q.beadID, map[string]string{
 			beadmeta.RouteQuarantineMetadataKey:       "",
